@@ -1,0 +1,36 @@
+[project]
+name = "mvm2"
+version = "0.1.0"
+description = "Multi-LLM Math Verification System — verify math solutions using consensus across multiple AI models"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "openai>=1.50",
+    "google-genai>=1.0",
+    "sympy>=1.13",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "python-multipart>=0.0.9",
+    "Pillow>=10.4",
+    "latex2sympy2>=1.9",
+    "structlog>=24.0",
+    "tenacity>=9.0",
+    "RestrictedPython>=7.0",
+    "reportlab>=4.0",
+    "matplotlib>=3.8",
+    "fpdf2>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.21", "ruff>=0.6"]
+frontend = ["streamlit>=1.38"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
