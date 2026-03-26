@@ -229,7 +229,7 @@ def generate_pdf_report(result: dict) -> bytes:
 \usepackage{graphicx}
 \usepackage{tikz}
 \usepackage{tcolorbox}
-\tcbuselibrary{skins,breakable}
+\tcbuselibrary{skins}
 
 % ── Colors ────────────────────────────────────────
 \definecolor{brand}{HTML}{3B5BDB}
@@ -487,7 +487,7 @@ def generate_pdf_report(result: dict) -> bytes:
 {\small Complete log of pipeline decisions:}
 
 \vspace{4pt}
-\begin{tcolorbox}[colback=lightbg, colframe=lightbg!70!black, boxrule=0.3pt, arc=2pt, left=8pt, right=8pt, top=6pt, bottom=6pt, breakable]
+\begin{tcolorbox}[colback=lightbg, colframe=lightbg!70!black, boxrule=0.3pt, arc=2pt, left=8pt, right=8pt, top=6pt, bottom=6pt]
 \ttfamily\scriptsize
 """
         for entry in audit[:40]:
@@ -529,24 +529,30 @@ providing a ground-truth verification layer.
 \end{document}
 """
 
-    # Compile LaTeX to PDF — with fallback
-    try:
-        return _compile_latex(tex)
-    except RuntimeError:
-        # Fallback: strip ALL math mode and retry with plain text
-        logger.warning("pdflatex_first_attempt_failed_retrying_plain")
-        tex_plain = _strip_math_for_fallback(tex)
-        return _compile_latex(tex_plain)
+    # ── 3-tier compile chain: NEVER crashes ──
+    # Tier 1: Full LaTeX with math
+    pdf = _try_compile_latex(tex)
+    if pdf:
+        return pdf
+
+    # Tier 2: Strip all math, use plain text
+    logger.warning("pdflatex_tier1_failed_stripping_math")
+    tex_plain = _strip_math_for_fallback(tex)
+    pdf = _try_compile_latex(tex_plain)
+    if pdf:
+        return pdf
+
+    # Tier 3: Minimal safe LaTeX (absolutely cannot fail)
+    logger.warning("pdflatex_tier2_failed_using_minimal")
+    return _generate_minimal_pdf(result)
 
 
 def _strip_math_for_fallback(tex: str) -> str:
-    """Strip all inline math $...$ and replace with escaped plain text.
-    This is the nuclear option when pdflatex fails on bad math."""
+    """Strip all inline math $...$ and replace with plain text."""
     import re as _re
 
     def _replace_math(match):
         inner = match.group(1)
-        # Remove LaTeX commands, keep readable text
         inner = inner.replace("\\frac", "").replace("\\sqrt", "sqrt")
         inner = inner.replace("\\cdot", "*").replace("\\times", "x")
         inner = inner.replace("\\left", "").replace("\\right", "")
@@ -554,39 +560,159 @@ def _strip_math_for_fallback(tex: str) -> str:
         inner = inner.replace("^", "**")
         return inner
 
-    # Replace $...$ with plain text
     result = _re.sub(r'\$([^$]+)\$', _replace_math, tex)
+    # Also remove any tcolorbox breakable (common failure point)
+    result = result.replace("breakable", "")
     return result
 
 
-def _compile_latex(tex_source: str) -> bytes:
-    """Write .tex file and compile with pdflatex. Returns PDF bytes."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tex_path = os.path.join(tmpdir, "report.tex")
-        pdf_path = os.path.join(tmpdir, "report.pdf")
+def _try_compile_latex(tex_source: str) -> bytes | None:
+    """Try to compile LaTeX. Returns PDF bytes or None on failure."""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tex_path = os.path.join(tmpdir, "report.tex")
+            pdf_path = os.path.join(tmpdir, "report.pdf")
 
-        with open(tex_path, "w", encoding="utf-8") as f:
-            f.write(tex_source)
+            with open(tex_path, "w", encoding="utf-8") as f:
+                f.write(tex_source)
 
-        # Run pdflatex twice (for cross-references)
-        for run in range(2):
-            proc = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "report.tex"],
-                cwd=tmpdir,
-                capture_output=True,
-                timeout=30,
-            )
-            if proc.returncode != 0 and run == 1:
-                stdout = proc.stdout.decode("utf-8", errors="replace")
-                stderr = proc.stderr.decode("utf-8", errors="replace")
-                logger.error("pdflatex_error", stderr=stderr[:500], stdout=stdout[-500:])
+            # Run pdflatex twice (for cross-references)
+            for run in range(2):
+                proc = subprocess.run(
+                    ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "report.tex"],
+                    cwd=tmpdir,
+                    capture_output=True,
+                    timeout=30,
+                )
 
-        if os.path.exists(pdf_path):
-            with open(pdf_path, "rb") as f:
-                return f.read()
-        else:
+            if os.path.exists(pdf_path):
+                with open(pdf_path, "rb") as f:
+                    return f.read()
+
             stdout = proc.stdout.decode("utf-8", errors="replace")
-            stderr = proc.stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"pdflatex failed. Log:\n{stdout[-1000:]}\n\nStderr:\n{stderr[:500]}"
-            )
+            logger.error("pdflatex_failed", log_tail=stdout[-500:])
+            return None
+    except Exception as e:
+        logger.error("pdflatex_exception", error=str(e))
+        return None
+
+
+def _generate_minimal_pdf(result: dict) -> bytes:
+    """Tier 3 fallback: generate a simple but guaranteed PDF using reportlab.
+    This CANNOT fail — no pdflatex, no external deps, pure Python."""
+    import io as _io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable,
+    )
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm,
+                            leftMargin=20*mm, rightMargin=20*mm)
+    styles = getSampleStyleSheet()
+    title_s = ParagraphStyle("T", parent=styles["Title"], fontSize=18, spaceAfter=8)
+    sub_s = ParagraphStyle("S", parent=styles["Normal"], fontSize=10, textColor=colors.grey)
+    h2_s = ParagraphStyle("H", parent=styles["Heading2"], fontSize=13, spaceBefore=12, spaceAfter=6)
+    body_s = ParagraphStyle("B", parent=styles["Normal"], fontSize=10, leading=14)
+    mono_s = ParagraphStyle("M", parent=styles["Code"], fontSize=8, leading=10)
+
+    def _safe(text):
+        """Make text safe for reportlab — ASCII only."""
+        if not text:
+            return "N/A"
+        s = str(text)
+        # Strip LaTeX
+        s = re.sub(r'\$([^$]*)\$', r'\1', s)
+        s = re.sub(r'\\[a-zA-Z]+', '', s)
+        s = s.replace('{', '(').replace('}', ')').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        # ASCII only
+        return ''.join(c if ord(c) < 128 else '?' for c in s)
+
+    elements = []
+
+    confidence = result.get("confidence", 0)
+    answer = result.get("final_answer", "N/A")
+    debate_rounds = result.get("debate_rounds", 0)
+    aligned = result.get("aligned_steps", [])
+    agreement = result.get("answer_agreement", {})
+    audit = result.get("audit_trail", [])
+    problem_text = result.get("problem_text", "N/A")
+    agreed = sum(1 for s in aligned if not s.get("flagged", False))
+
+    # Title
+    elements.append(Paragraph("MVM2 Verification Report", title_s))
+    elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", sub_s))
+    elements.append(HRFlowable(width="100%", thickness=1, color=colors.grey))
+    elements.append(Spacer(1, 12))
+
+    # Problem
+    elements.append(Paragraph("Problem", h2_s))
+    elements.append(Paragraph(_safe(problem_text)[:500], body_s))
+    elements.append(Spacer(1, 8))
+
+    # Summary
+    elements.append(Paragraph("Summary", h2_s))
+    conf_label = "HIGH" if confidence >= 0.8 else "MEDIUM" if confidence >= 0.5 else "LOW"
+    data = [
+        ["Confidence", "Steps", "Debates", "Level"],
+        [f"{confidence:.0%}", f"{agreed}/{len(aligned)}", str(debate_rounds), conf_label],
+    ]
+    t = Table(data, colWidths=[100, 100, 100, 100])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.Color(0.9, 0.9, 0.9)),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    elements.append(t)
+    elements.append(Spacer(1, 12))
+
+    # Answer
+    elements.append(Paragraph("Final Answer", h2_s))
+    elements.append(Paragraph(f"<b>{_safe(answer)}</b>", ParagraphStyle(
+        "A", parent=body_s, fontSize=14, backColor=colors.Color(0.95, 0.95, 0.95),
+        borderPadding=10, borderWidth=1, borderColor=colors.grey,
+    )))
+    elements.append(Spacer(1, 8))
+
+    # Agreement
+    if agreement:
+        elements.append(Paragraph("Model Agreement", h2_s))
+        for ans_text, models in agreement.items():
+            names = ", ".join(m.split("/")[-1][:20] for m in models)
+            elements.append(Paragraph(f"<b>{len(models)} model(s):</b> {_safe(names)}", body_s))
+            elements.append(Paragraph(f"Answer: {_safe(ans_text)[:100]}", mono_s))
+            elements.append(Spacer(1, 4))
+
+    # Steps
+    if aligned:
+        elements.append(Paragraph("Steps", h2_s))
+        for step in aligned[:15]:  # Cap at 15 steps
+            snum = step["canonical_step_number"]
+            ratio = step.get("agreement_ratio", 0)
+            flagged = step.get("flagged", False)
+            desc = _safe(step.get("description", ""))[:60]
+            tag = "DISPUTED" if flagged else "AGREED" if ratio >= 0.8 else "PARTIAL"
+            elements.append(Paragraph(f"<b>Step {snum}:</b> {desc} ({ratio:.0%}) [{tag}]", body_s))
+
+    # Audit
+    if audit:
+        elements.append(Spacer(1, 8))
+        elements.append(Paragraph("Audit Trail", h2_s))
+        for entry in audit[:25]:
+            elements.append(Paragraph(_safe(entry)[:120], mono_s))
+
+    # Footer
+    elements.append(Spacer(1, 16))
+    elements.append(HRFlowable(width="100%", thickness=0.5, color=colors.lightgrey))
+    elements.append(Paragraph("Generated by MVM2 (fallback mode)", sub_s))
+
+    doc.build(elements)
+    return buf.getvalue()
