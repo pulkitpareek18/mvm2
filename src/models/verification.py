@@ -24,4 +24,5 @@ class VerificationResult(BaseModel):
     answer_agreement: dict[str, list[str]] = {}  # answer -> [model_names]
     debate_rounds: int = 0
     symbolic_override: bool = False
+    confidence_breakdown: dict = {}  # Per-signal confidence scores
     audit_trail: list[str] = []

@@ -89,6 +89,47 @@ async def classify_problem(problem_text: str, provider) -> ProblemType:
         return ProblemType.UNKNOWN
 
 
+async def _try_pix2text_ocr(image_data: bytes) -> tuple[str, list[float]]:
+    """Try OCR with Pix2Text. Returns (extracted_text, confidence_scores).
+
+    Pix2Text is specialized for math OCR and provides per-formula
+    confidence scores that we use for calibrated confidence scoring.
+    """
+    import asyncio
+    from io import BytesIO
+    from PIL import Image
+
+    def _run_pix2text(img_bytes: bytes) -> tuple[str, list[float]]:
+        from pix2text import Pix2Text
+
+        p2t = Pix2Text.from_config()
+        img = Image.open(BytesIO(img_bytes))
+
+        # recognize_formula returns detailed dict with scores when return_text=False
+        result = p2t.recognize(img, file_type='text_formula')
+
+        # Extract text and scores
+        if isinstance(result, str):
+            return result, [0.8]  # String result — no detailed scores
+        elif isinstance(result, list):
+            texts = []
+            scores = []
+            for item in result:
+                if isinstance(item, dict):
+                    texts.append(item.get('text', ''))
+                    scores.append(item.get('score', 0.8))
+                elif isinstance(item, str):
+                    texts.append(item)
+                    scores.append(0.8)
+            return ' '.join(texts), scores if scores else [0.8]
+        else:
+            return str(result), [0.8]
+
+    # Run in thread pool to avoid blocking async loop
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_pix2text, image_data)
+
+
 async def process_input(
     problem: MathProblem,
     providers: list,
@@ -106,9 +147,29 @@ async def process_input(
             cheapest_provider = p  # first provider is assumed cheapest
 
     # OCR: extract text from image if provided
+    # Strategy: Try Pix2Text first (better math OCR + confidence scores),
+    # fall back to LLM vision if Pix2Text unavailable or fails.
     if problem.image_data:
-        if vision_provider:
-            logger.info("ocr_starting", provider=vision_provider.model_name)
+        ocr_done = False
+
+        # Tier 1: Pix2Text (specialized math OCR with confidence scores)
+        try:
+            extracted, ocr_scores = await _try_pix2text_ocr(problem.image_data)
+            if extracted:
+                problem.normalized_text = extracted
+                if not problem.raw_text or problem.raw_text.strip() == "":
+                    problem.raw_text = extracted
+                # Store OCR scores for confidence calibration
+                problem._ocr_scores = ocr_scores  # type: ignore
+                logger.info("pix2text_ocr_success", text=extracted[:100],
+                           scores=ocr_scores)
+                ocr_done = True
+        except Exception as e:
+            logger.warning("pix2text_ocr_failed", error=str(e))
+
+        # Tier 2: LLM Vision fallback
+        if not ocr_done and vision_provider:
+            logger.info("ocr_fallback_llm", provider=vision_provider.model_name)
             extracted_text = await extract_text_from_image(
                 problem.image_data, vision_provider
             )
@@ -116,11 +177,11 @@ async def process_input(
                 problem.normalized_text = extracted_text
                 if not problem.raw_text or problem.raw_text.strip() == "":
                     problem.raw_text = extracted_text
-                logger.info("ocr_success", extracted_text=extracted_text[:100])
+                logger.info("llm_ocr_success", extracted_text=extracted_text[:100])
             else:
                 logger.error("ocr_returned_empty")
-        else:
-            logger.error("no_vision_provider", available=[p.model_name for p in providers])
+        elif not ocr_done:
+            logger.error("no_ocr_available", has_vision=bool(vision_provider))
 
     if not problem.normalized_text:
         problem.normalized_text = problem.raw_text

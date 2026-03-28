@@ -248,24 +248,35 @@ async def verify_math_problem(
         audit_trail.append(f"Answer verification error: {e}")
         logger.warning("answer_verification_error", error=str(e))
 
-    # === STAGE 10: Final confidence ===
-    if aligned_steps:
-        avg_agreement = sum(s.agreement_ratio for s in aligned_steps) / len(aligned_steps)
-        final_confidence = (answer_confidence * 0.6) + (avg_agreement * 0.4)
-    else:
-        final_confidence = answer_confidence
+    # === STAGE 10: Calibrated Confidence Scoring ===
+    # Uses the LLM-Uncertainty-Bench approach adapted for API-only models:
+    # Self-consistency (5 models) + SymPy verification + verbalized confidence
+    from .confidence import compute_calibrated_confidence
 
-    # Boost confidence based on verification strength
-    if symbolic_override:
-        # SymPy independently verified the answer
-        if answer_confidence >= 0.9:
-            # Models agree + SymPy confirms = very high confidence
-            final_confidence = max(final_confidence, 0.95)
-        else:
-            # SymPy override (models disagreed but SymPy knows) = good but not perfect
-            final_confidence = max(final_confidence, 0.80)
+    # Collect raw responses for verbalized confidence analysis
+    raw_responses = [s.raw_response for s in solutions if s.raw_response]
 
-    audit_trail.append(f"Final confidence: {final_confidence:.0%}")
+    # Collect step-level verification results
+    step_verifications = [s.symbolic_verified for s in aligned_steps] if aligned_steps else None
+
+    # Compute calibrated confidence
+    conf_result = compute_calibrated_confidence(
+        answer_agreement=answer_agreement,
+        aligned_steps=[s.model_dump() for s in aligned_steps] if aligned_steps else [],
+        sympy_override=symbolic_override,
+        sympy_verified=None,  # Individual answer verification handled above
+        step_verifications=step_verifications,
+        raw_responses=raw_responses,
+        ocr_scores=getattr(problem, '_ocr_scores', None),
+        image_provided=problem.image_data is not None,
+        total_models=len(providers),
+    )
+
+    final_confidence = conf_result["confidence"]
+    breakdown = conf_result["breakdown"]
+
+    audit_trail.append(f"Confidence breakdown: {breakdown['signals']}")
+    audit_trail.append(f"Final calibrated confidence: {final_confidence:.0%}")
 
     # Build result
     model_solutions_dict = {}
@@ -284,6 +295,7 @@ async def verify_math_problem(
         answer_agreement=answer_agreement,
         debate_rounds=debate_rounds,
         symbolic_override=symbolic_override,
+        confidence_breakdown=breakdown,
         audit_trail=audit_trail,
     )
 
